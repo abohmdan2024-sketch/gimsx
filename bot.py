@@ -1087,10 +1087,18 @@ class BotInstance:
                 return
             await query.answer()
             self.active_games[chat_id] = {"type": "xo_lobby", "player_x": user.id, "name_x": user.full_name}
+                        invite_text = f"⚔️ يدعوك {user.full_name} لتحدي لعبة XO الآن!"
             markup = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚔️ قبول التحدي (اللاعب الثاني)", callback_data="xo_join")],
+                [
+                    InlineKeyboardButton(
+                        "📣 دعوة لاعب للانضمام إليك",
+                        switch_inline_query=invite_text,
+                    )
+                ],
                 [InlineKeyboardButton("❌ إلغاء", callback_data="game_cancel")],
             ])
+
             await query.message.reply_text(
                 f"❌⭕ <b>تحدي لعبة XO</b>\nاللاعب الأول (❌): <b>{user.full_name}</b>\nبانتظار انضمام اللاعب الثاني (⭕)...",
                 reply_markup=markup,
