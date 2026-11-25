@@ -3,7 +3,7 @@
 # =========================================================
 
 # 1. ضع توكن البوت الرئيسي (بوت المصنع / الأم) من @BotFather بين علامتي التنصيص:
-BOT_TOKEN = 5594004374:AAHRqtYcbx-WSDdQ6jdOBktfkpmmD4JVxfA
+BOT_TOKEN = "5594004374:AAHRqtYcbx-WSDdQ6jdOBktfkpmmD4JVxfA"
 
 # 2. آيدي المطور / مالك البوت الرئيسي:
 OWNER_ID = 433161036
