@@ -135,6 +135,8 @@ class BotInstance:
         self.data_file = os.path.join(DATA_DIR, f"bot_{bot_id}.json")
 
         self.active_games: Dict[int, Dict[str, Any]] = {}
+        self.xo_waiting_rooms: Dict[str, Dict[str, Any]] = {}
+        self.xo_sessions: Dict[str, Dict[str, Any]] = {}
         self.pending_actions: Dict[int, Dict[str, Any]] = {}
         self.last_action_time: Dict[int, float] = {}
 
@@ -699,6 +701,11 @@ class BotInstance:
                 )
             return
 
+        if context.args and len(context.args) > 0 and context.args[0].startswith("xo_"):
+            room_id = context.args[0].replace("xo_", "", 1)
+            await self.join_xo_room_by_id(update, context, room_id)
+            return
+
         welcome_txt = self.db["settings"].get("welcome_text", self.default_db()["settings"]["welcome_text"])
         if update.effective_message:
             await update.effective_message.reply_text(
@@ -722,7 +729,7 @@ class BotInstance:
         await self.show_admin_panel(update, context, edit=False)
 
     # ================= الألعاب =================
-    def build_xo_markup(self, board: List[str]) -> InlineKeyboardMarkup:
+    def build_xo_markup(self, board: List[str], session_id: str) -> InlineKeyboardMarkup:
         rows = []
         for r in range(3):
             row_btns = []
@@ -730,10 +737,125 @@ class BotInstance:
                 idx = r * 3 + c
                 val = board[idx]
                 symbol = "❌" if val == "X" else ("⭕" if val == "O" else "⬜")
-                row_btns.append(InlineKeyboardButton(symbol, callback_data=f"xo_move_{idx}"))
+                row_btns.append(InlineKeyboardButton(symbol, callback_data=f"xo_move_{session_id}_{idx}"))
             rows.append(row_btns)
-        rows.append([InlineKeyboardButton("🛑 إنهاء اللعبة", callback_data="game_cancel")])
+        rows.append([InlineKeyboardButton("🛑 إنهاء اللعبة", callback_data=f"xo_cancel_{session_id}")])
         return InlineKeyboardMarkup(rows)
+
+    def format_xo_board_header(self, session: Dict[str, Any], status_line: str) -> str:
+        return (
+            f"❌⭕ <b>لعبة XO (3 جولات) — الجولة {session['round_num']} من 3</b>
+"
+            f"━━━━━━━━━━━━━━━━━━━━
+"
+            f"❌ <b>{session['name_x']}</b>: <b>{session['score_x']}</b> | "
+            f"⭕ <b>{session['name_o']}</b>: <b>{session['score_o']}</b>
+"
+            f"━━━━━━━━━━━━━━━━━━━━
+"
+            f"{status_line}"
+        )
+
+    async def broadcast_xo_board(self, context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any], status_line: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+        text = self.format_xo_board_header(session, status_line)
+        for target_key in ("msg_x", "msg_o"):
+            info = session.get(target_key)
+            if not info:
+                continue
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=info["chat_id"],
+                    message_id=info["message_id"],
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update XO board ({target_key}): {e}")
+
+    async def join_xo_room_by_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE, room_id: str) -> None:
+        user = update.effective_user
+        chat = update.effective_chat
+        if not user or not chat:
+            return
+
+        room = self.xo_waiting_rooms.get(room_id)
+        if not room:
+            msg_txt = "❌ هذه الجولة غير متاحة أو تم الانضمام إليها مسبقاً."
+            if update.callback_query:
+                await update.callback_query.answer(msg_txt, show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(msg_txt)
+            return
+
+        if room["player_x"] == user.id:
+            msg_txt = "⚠️ لا يمكنك الانضمام إلى جولتك الخاصة! أرسل رابط الدعوة لصديقك."
+            if update.callback_query:
+                await update.callback_query.answer(msg_txt, show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(msg_txt)
+            return
+
+        self.xo_waiting_rooms.pop(room_id, None)
+        session_id = f"{room_id}_{int(now_ts())}"
+        session: Dict[str, Any] = {
+            "session_id": session_id,
+            "board": [""] * 9,
+            "player_x": room["player_x"],
+            "name_x": room["name_x"],
+            "chat_x": room["chat_id"],
+            "player_o": user.id,
+            "name_o": user.full_name,
+            "chat_o": chat.id,
+            "turn": "X",
+            "round_num": 1,
+            "score_x": 0,
+            "score_o": 0,
+            "msg_x": None,
+            "msg_o": None,
+        }
+        self.xo_sessions[session_id] = session
+
+        markup = self.build_xo_markup(session["board"], session_id)
+        header_txt = self.format_xo_board_header(
+            session,
+            f"⚔️ انضم ⭕ <b>{user.full_name}</b> إلى التحدي!
+الدور الآن: ❌ <b>{session['name_x']}</b>",
+        )
+
+        # إرسال/تحديث لوحة اللعب للاعب الثاني (المنضم)
+        if update.callback_query and update.callback_query.message:
+            await update.callback_query.answer("تم الانضمام! بدأت الجولة الأولى.")
+            sent_o = await update.callback_query.message.edit_text(
+                header_txt,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            )
+            session["msg_o"] = {"chat_id": sent_o.chat_id, "message_id": sent_o.message_id}
+        elif update.effective_message:
+            sent_o = await update.effective_message.reply_text(
+                header_txt,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            )
+            session["msg_o"] = {"chat_id": sent_o.chat_id, "message_id": sent_o.message_id}
+
+        # إرسال/تحديث لوحة اللعب للاعب الأول (صاحب الجولة)
+        try:
+            if room.get("wait_message_id"):
+                try:
+                    await context.bot.delete_message(chat_id=room["chat_id"], message_id=room["wait_message_id"])
+                except Exception:
+                    pass
+            sent_x = await context.bot.send_message(
+                chat_id=room["chat_id"],
+                text=header_txt,
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            )
+            session["msg_x"] = {"chat_id": sent_x.chat_id, "message_id": sent_x.message_id}
+        except Exception as e:
+            logger.warning(f"Failed to send XO start message to player X: {e}")
 
     def check_xo_winner(self, board: List[str]) -> Optional[str]:
         wins = [
@@ -1086,99 +1208,242 @@ class BotInstance:
                 await query.answer("لعبة XO معطلة حالياً.", show_alert=True)
                 return
             await query.answer()
-            self.active_games[chat_id] = {"type": "xo_lobby", "player_x": user.id, "name_x": user.full_name}
-                        invite_text = f"⚔️ يدعوك {user.full_name} لتحدي لعبة XO الآن!"
+            waiting_count = len(self.xo_waiting_rooms)
             markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚔️ قبول التحدي (اللاعب الثاني)", callback_data="xo_join")],
-                [
-                    InlineKeyboardButton(
-                        "📣 دعوة لاعب للانضمام إليك",
-                        switch_inline_query=invite_text,
-                    )
-                ],
-                [InlineKeyboardButton("❌ إلغاء", callback_data="game_cancel")],
+                [InlineKeyboardButton("➕ بدء جولة جديدة", callback_data="xo_create_room")],
+                [InlineKeyboardButton(f"📥 الانضمام إلى جولة ({waiting_count})", callback_data="xo_list_rooms")],
+                [InlineKeyboardButton("⬅️ رجوع للقائمة الرئيسية", callback_data="back_main_menu")],
             ])
-
-            await query.message.reply_text(
-                f"❌⭕ <b>تحدي لعبة XO</b>\nاللاعب الأول (❌): <b>{user.full_name}</b>\nبانتظار انضمام اللاعب الثاني (⭕)...",
+            await query.message.edit_text(
+                "❌⭕ <b>لعبة XO (نظام 3 جولات)</b>
+"
+                "━━━━━━━━━━━━━━━━━━━━
+"
+                "اختر <b>بدء جولة جديدة</b> لإضافتها إلى قائمة الانتظار أو دعوة صديقك، أو اختر <b>الانضمام إلى جولة</b> للعب مع لاعب منتظر:",
                 reply_markup=markup,
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        if data == "xo_join":
-            game = self.active_games.get(chat_id)
-            if not game or game.get("type") != "xo_lobby":
-                await query.answer("انتهت صلاحية هذا التحدي.", show_alert=True)
+        if data == "xo_create_room":
+            if not self.db["settings"]["games"].get("xo", True):
+                await query.answer("لعبة XO معطلة حالياً.", show_alert=True)
                 return
-            if user.id == game["player_x"]:
-                await query.answer("لا يمكنك اللعب ضد نفسك! اطلب من شخص آخر الانضمام.", show_alert=True)
-                return
-            await query.answer("بدأ التحدي!")
-            self.active_games[chat_id] = {
-                "type": "xo",
-                "board": [""] * 9,
-                "player_x": game["player_x"],
-                "name_x": game["name_x"],
-                "player_o": user.id,
-                "name_o": user.full_name,
-                "turn": "X",
+            # إزالة أي جولة انتظار سابقة لنفس اللاعب
+            for rid in [k for k, v in self.xo_waiting_rooms.items() if v["player_x"] == user.id]:
+                self.xo_waiting_rooms.pop(rid, None)
+
+            room_id = f"{user.id}_{random.randint(1000, 9999)}"
+            bot_me = await context.bot.get_me()
+            invite_link = f"https://t.me/{bot_me.username}?start=xo_{room_id}"
+            share_text = f"تعال نلعب جولة XO (3 مراحل) ضد {user.full_name}!"
+            share_url = f"https://t.me/share/url?url={invite_link}&text={share_text}"
+
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📨 دعوة لاعب آخر (مشاركة الرابط)", url=share_url)],
+                [InlineKeyboardButton("❌ إلغاء الجولة والانتظار", callback_data=f"xo_leave_wait_{room_id}")],
+            ])
+            await query.answer("تمت إضافة جولتك إلى قائمة الانتظار!")
+            sent = await query.message.edit_text(
+                f"⏳ <b>جولتك الآن في قائمة الانتظار!</b>
+"
+                f"━━━━━━━━━━━━━━━━━━━━
+"
+                f"• اللاعب الأول (❌): <b>{user.full_name}</b>
+"
+                f"• النظام: <b>3 جولات</b>
+"
+                f"• رابط الدعوة المباشر لصديقك:
+<code>{invite_link}</code>
+
+"
+                f"بانتظار دخول صديقك عبر الرابط أو انضمام لاعب من قائمة الانتظار...",
+                reply_markup=markup,
+                parse_mode=ParseMode.HTML,
+            )
+            self.xo_waiting_rooms[room_id] = {
+                "room_id": room_id,
+                "player_x": user.id,
+                "name_x": user.full_name,
+                "chat_id": sent.chat_id,
+                "wait_message_id": sent.message_id,
+                "created_at": now_ts(),
             }
-            g_now = self.active_games[chat_id]
+            return
+
+        if data.startswith("xo_leave_wait_"):
+            room_id = data.replace("xo_leave_wait_", "", 1)
+            room = self.xo_waiting_rooms.get(room_id)
+            if room and room["player_x"] != user.id:
+                await query.answer("هذه الجولة لا تخصك.", show_alert=True)
+                return
+            self.xo_waiting_rooms.pop(room_id, None)
+            await query.answer("تم إلغاء الجولة وإزالتها من الانتظار.")
             await query.message.edit_text(
-                f"❌⭕ <b>بدأت لعبة XO!</b>\n❌: <b>{g_now['name_x']}</b> ضد ⭕: <b>{g_now['name_o']}</b>\n\nالدور الآن: ❌ <b>{g_now['name_x']}</b>",
-                reply_markup=self.build_xo_markup(g_now["board"]),
+                "❌ تم إلغاء جولة XO وإزالتها من قائمة الانتظار.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ رجوع للعبة XO", callback_data="game_xo_lobby")]]),
+            )
+            return
+
+        if data == "xo_list_rooms":
+            await query.answer()
+            available_rooms = [r for r in self.xo_waiting_rooms.values() if r["player_x"] != user.id]
+            if not available_rooms:
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ بدء جولة جديدة", callback_data="xo_create_room")],
+                    [InlineKeyboardButton("🔄 تحديث القائمة", callback_data="xo_list_rooms")],
+                    [InlineKeyboardButton("⬅️ رجوع", callback_data="game_xo_lobby")],
+                ])
+                await query.message.edit_text(
+                    "📭 <b>قائمة الانتظار فارغة حالياً</b>
+لا توجد جولات متاحة للانضمام، يمكنك بدء جولة جديدة وانتظار منافس.",
+                    reply_markup=markup,
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            rows = []
+            for r in available_rooms[:10]:
+                rows.append([
+                    InlineKeyboardButton(
+                        f"⚔️ انضم ضد: {r['name_x']}",
+                        callback_data=f"xo_join_room_{r['room_id']}",
+                    )
+                ])
+            rows.append([InlineKeyboardButton("🔄 تحديث القائمة", callback_data="xo_list_rooms")])
+            rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="game_xo_lobby")])
+            await query.message.edit_text(
+                f"📋 <b>الجولات المتاحة في قائمة الانتظار ({len(available_rooms)}):</b>
+اختر جولة للانضمام وبدء اللعب فوراً:",
+                reply_markup=InlineKeyboardMarkup(rows),
                 parse_mode=ParseMode.HTML,
             )
             return
 
-        if data.startswith("xo_move_"):
-            idx = int(data.split("_")[-1])
-            game = self.active_games.get(chat_id)
-            if not game or game.get("type") != "xo":
-                await query.answer("هذه الجولة منتهية.", show_alert=True)
+        if data.startswith("xo_join_room_"):
+            room_id = data.replace("xo_join_room_", "", 1)
+            await self.join_xo_room_by_id(update, context, room_id)
+            return
+
+        if data.startswith("xo_cancel_"):
+            session_id = data.replace("xo_cancel_", "", 1)
+            session = self.xo_sessions.get(session_id)
+            if not session:
+                await query.answer("هذه الجولة منتهية بالفعل.", show_alert=True)
                 return
-            expected_uid = game["player_x"] if game["turn"] == "X" else game["player_o"]
+            if user.id not in (session["player_x"], session["player_o"]):
+                await query.answer("أنت لست طرفاً في هذه المباراة!", show_alert=True)
+                return
+            self.xo_sessions.pop(session_id, None)
+            await query.answer("تم إنهاء المباراة.")
+            await self.broadcast_xo_board(
+                context,
+                session,
+                f"🛑 تم إنهاء المباراة بواسطة <b>{user.full_name}</b>.",
+                reply_markup=None,
+            )
+            return
+
+        if data.startswith("xo_move_"):
+            parts = data.split("_")
+            idx = int(parts[-1])
+            session_id = "_".join(parts[2:-1])
+            session = self.xo_sessions.get(session_id)
+            if not session:
+                await query.answer("هذه المباراة منتهية.", show_alert=True)
+                return
+
+            expected_uid = session["player_x"] if session["turn"] == "X" else session["player_o"]
             if user.id != expected_uid:
                 await query.answer("ليس دورك الآن!", show_alert=True)
                 return
-            if game["board"][idx] != "":
+            if session["board"][idx] != "":
                 await query.answer("هذه الخانة مشغولة!", show_alert=True)
                 return
 
-            symbol = game["turn"]
-            game["board"][idx] = symbol
-            res = self.check_xo_winner(game["board"])
+            symbol = session["turn"]
+            session["board"][idx] = symbol
+            res = self.check_xo_winner(session["board"])
             pts = self.db["settings"].get("win_points", 10)
 
-            if res in ("X", "O"):
-                winner_uid = game["player_x"] if res == "X" else game["player_o"]
-                winner_name = game["name_x"] if res == "X" else game["name_o"]
-                new_pts = self.add_points(winner_uid, pts)
-                self.active_games.pop(chat_id, None)
-                await query.message.edit_text(
-                    f"🎉 <b>مبروك الفوز في XO!</b>\nالفائز: <b>{winner_name}</b> ({'❌' if res=='X' else '⭕'})\n🏆 حصل على +{pts} نقاط (المجموع: {new_pts})",
-                    reply_markup=self.build_xo_markup(game["board"]),
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            elif res == "DRAW":
-                self.active_games.pop(chat_id, None)
-                await query.message.edit_text(
-                    "🤝 <b>تعادل في لعبة XO!</b>\nانتهت الجولة دون فائز.",
-                    reply_markup=self.build_xo_markup(game["board"]),
-                    parse_mode=ParseMode.HTML,
-                )
-                return
+            if res in ("X", "O", "DRAW"):
+                if res == "X":
+                    session["score_x"] += 1
+                    round_banner = f"✅ فاز في الجولة {session['round_num']}: ❌ <b>{session['name_x']}</b>"
+                elif res == "O":
+                    session["score_o"] += 1
+                    round_banner = f"✅ فاز في الجولة {session['round_num']}: ⭕ <b>{session['name_o']}</b>"
+                else:
+                    round_banner = f"🤝 انتهت الجولة {session['round_num']} بالتعادل!"
 
-            game["turn"] = "O" if symbol == "X" else "X"
-            next_name = game["name_o"] if game["turn"] == "O" else game["name_x"]
-            next_sym = "❌" if game["turn"] == "X" else "⭕"
+                # التحقق هل اكتملت المراحل الثلاث أم لا
+                if session["round_num"] < 3:
+                    session["round_num"] += 1
+                    session["board"] = [""] * 9
+                    # تبديل البادئ في الجولة التالية للعدالة
+                    session["turn"] = "O" if session["round_num"] % 2 == 0 else "X"
+                    next_name = session["name_o"] if session["turn"] == "O" else session["name_x"]
+                    next_sym = "⭕" if session["turn"] == "O" else "❌"
+                    await query.answer("انتهت الجولة! بدأت الجولة التالية.")
+                    await self.broadcast_xo_board(
+                        context,
+                        session,
+                        f"{round_banner}
+
+▶️ <b>بدأت الجولة {session['round_num']} من 3!</b>
+الدور الآن: {next_sym} <b>{next_name}</b>",
+                        reply_markup=self.build_xo_markup(session["board"], session_id),
+                    )
+                    return
+                else:
+                    # انتهت الجولات الثلاث بالكامل -> إعلان الفائز النهائي
+                    final_board = session["board"][:]
+                    self.xo_sessions.pop(session_id, None)
+                    if session["score_x"] > session["score_o"]:
+                        new_pts = self.add_points(session["player_x"], pts)
+                        final_text = (
+                            f"{round_banner}
+
+"
+                            f"🏆 <b>انتهت المراحل الثلاث! الفائز النهائي:</b> ❌ <b>{session['name_x']}</b>
+"
+                            f"⭐ حصل على +{pts} نقاط (المجموع: {new_pts})"
+                        )
+                    elif session["score_o"] > session["score_x"]:
+                        new_pts = self.add_points(session["player_o"], pts)
+                        final_text = (
+                            f"{round_banner}
+
+"
+                            f"🏆 <b>انتهت المراحل الثلاث! الفائز النهائي:</b> ⭕ <b>{session['name_o']}</b>
+"
+                            f"⭐ حصل على +{pts} نقاط (المجموع: {new_pts})"
+                        )
+                    else:
+                        final_text = (
+                            f"{round_banner}
+
+"
+                            f"🤝 <b>انتهت المراحل الثلاث بالتعادل الإجمالي ({session['score_x']} - {session['score_o']})!</b>"
+                        )
+                    await query.answer("انتهت المراحل الثلاث!")
+                    await self.broadcast_xo_board(
+                        context,
+                        session,
+                        final_text,
+                        reply_markup=None,
+                    )
+                    return
+
+            session["turn"] = "O" if symbol == "X" else "X"
+            next_name = session["name_o"] if session["turn"] == "O" else session["name_x"]
+            next_sym = "❌" if session["turn"] == "X" else "⭕"
             await query.answer()
-            await query.message.edit_text(
-                f"❌⭕ <b>لعبة XO جارية</b>\n❌: <b>{game['name_x']}</b> ضد ⭕: <b>{game['name_o']}</b>\n\nالدور الآن: {next_sym} <b>{next_name}</b>",
-                reply_markup=self.build_xo_markup(game["board"]),
-                parse_mode=ParseMode.HTML,
+            await self.broadcast_xo_board(
+                context,
+                session,
+                f"الدور الآن: {next_sym} <b>{next_name}</b>",
+                reply_markup=self.build_xo_markup(session["board"], session_id),
             )
             return
 
@@ -1546,6 +1811,8 @@ class BotInstance:
 
         if data == "stop_all_games":
             self.active_games.clear()
+            self.xo_waiting_rooms.clear()
+            self.xo_sessions.clear()
             await query.answer("تم إنهاء جميع الجولات النشطة", show_alert=True)
             return
 
