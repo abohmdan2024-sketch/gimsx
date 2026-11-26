@@ -29,6 +29,7 @@ from telegram.ext import (
 )
 
 import config
+from force_sub import ForceSubManager
 
 # ================= إعدادات التسجيل =================
 logging.basicConfig(
@@ -141,6 +142,11 @@ class BotInstance:
         self.last_action_time: Dict[int, float] = {}
 
         self.db = self.load_db()
+        self.force_sub = ForceSubManager(
+            owner_id=OWNER_ID,
+            is_master=is_master,
+            default_text=self.default_db()["settings"]["force_sub_text"],
+        )
 
     def default_db(self) -> Dict[str, Any]:
         return {
@@ -221,32 +227,12 @@ class BotInstance:
     def get_effective_channels(self) -> List[Dict[str, Any]]:
         """
         يدمج قنوات المطور الإلزامية (غير قابلة للحذف أو التعديل من المستخدمين)
-        مع القنوات الإضافية التي يضيفها مالك البوت الفرعي.
+        مع القنوات الإضافية التي يضيفها مالك البوت الفرعي عبر ForceSubManager.
         """
-        merged: List[Dict[str, Any]] = []
-        seen = set()
-        for ch in REGISTRY.get("global_channels", []):
-            if ch.get("enabled", True):
-                uname = ch["username"].lstrip("@").lower()
-                seen.add(uname)
-                merged.append({
-                    "username": ch["username"].lstrip("@"),
-                    "title": ch.get("title") or ch["username"],
-                    "enabled": True,
-                    "locked": True,
-                })
-        for ch in self.db.get("extra_channels", []):
-            if ch.get("enabled", True):
-                uname = ch["username"].lstrip("@").lower()
-                if uname not in seen:
-                    seen.add(uname)
-                    merged.append({
-                        "username": ch["username"].lstrip("@"),
-                        "title": ch.get("title") or ch["username"],
-                        "enabled": True,
-                        "locked": False,
-                    })
-        return merged
+        return self.force_sub.get_effective_channels(
+            global_channels=REGISTRY.get("global_channels", []),
+            extra_channels=self.db.get("extra_channels", []),
+        )
 
     def register_user(self, user) -> Dict[str, Any]:
         uid = str(user.id)
@@ -344,44 +330,21 @@ class BotInstance:
         return InlineKeyboardMarkup(rows)
 
     async def check_subscription(self, bot, user_id: int) -> List[Dict[str, Any]]:
-        # القنوات الأساسية للمطور تُفحص دائماً ولا يمكن تعطيلها من البوت الفرعي
-        channels_to_check = self.get_effective_channels()
-        if not self.is_master:
-            # في البوتات الفرعية: حتى لو عطّل المستخدم اشتراكه الإضافي، تبقى قنوات المطور إلزامية دائماً
-            if not self.db["settings"].get("force_sub_enabled", True):
-                channels_to_check = [c for c in channels_to_check if c.get("locked")]
-        else:
-            if not self.db["settings"].get("force_sub_enabled", True):
-                return []
-
-        if self.is_bot_admin(user_id):
-            return []
-
-        missing = []
-        for ch in channels_to_check:
-            uname = ch["username"].lstrip("@")
-            chat_ref = f"@{uname}"
-            try:
-                member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
-                if member.status in ("left", "kicked"):
-                    missing.append(ch)
-            except Exception as e:
-                logger.warning(f"[{self.bot_id}] Force sub check warning for {chat_ref}: {e}")
-                continue
-        return missing
+        return await self.force_sub.check_subscription(
+            bot=bot,
+            user_id=user_id,
+            global_channels=REGISTRY.get("global_channels", []),
+            extra_channels=self.db.get("extra_channels", []),
+            force_sub_enabled=self.db["settings"].get("force_sub_enabled", True),
+            is_admin=self.is_bot_admin(user_id),
+        )
 
     def build_force_sub_markup(self) -> InlineKeyboardMarkup:
-        channels = self.get_effective_channels()
-        if not self.is_master and not self.db["settings"].get("force_sub_enabled", True):
-            channels = [c for c in channels if c.get("locked")]
-
-        rows = []
-        for ch in channels:
-            uname = ch["username"].lstrip("@")
-            title = ch.get("title") or uname
-            rows.append([InlineKeyboardButton(f"📢 {title}", url=f"https://t.me/{uname}")])
-        rows.append([InlineKeyboardButton("✅ تحققت من الاشتراك", callback_data="check_sub_again")])
-        return InlineKeyboardMarkup(rows)
+        return self.force_sub.build_force_sub_markup(
+            global_channels=REGISTRY.get("global_channels", []),
+            extra_channels=self.db.get("extra_channels", []),
+            force_sub_enabled=self.db["settings"].get("force_sub_enabled", True),
+        )
 
     async def guard_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE, is_group_action: bool = False) -> bool:
         user = update.effective_user
@@ -430,32 +393,17 @@ class BotInstance:
                 await update.effective_message.reply_text("👥 اللعب متاح داخل المجموعات فقط.")
             return False
 
-        if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and not self.db["settings"].get("force_sub_in_groups", True):
-            return True
-
-        missing = await self.check_subscription(context.bot, uid)
-        if missing:
-            text = self.db["settings"].get("force_sub_text", self.default_db()["settings"]["force_sub_text"])
-            markup = self.build_force_sub_markup()
-            if update.callback_query:
-                try:
-                    await update.callback_query.answer("يرجى الاشتراك في القنوات أولاً", show_alert=False)
-                    await update.callback_query.message.reply_text(
-                        text,
-                        reply_markup=markup,
-                        reply_to_message_id=update.callback_query.message.message_id if is_group_action else None,
-                    )
-                except Exception:
-                    pass
-            elif update.effective_message:
-                await update.effective_message.reply_text(
-                    text,
-                    reply_markup=markup,
-                    reply_to_message_id=update.effective_message.message_id if is_group_action else None,
-                )
-            return False
-
-        return True
+        return await self.force_sub.enforce(
+            update=update,
+            context=context,
+            global_channels=REGISTRY.get("global_channels", []),
+            extra_channels=self.db.get("extra_channels", []),
+            force_sub_enabled=self.db["settings"].get("force_sub_enabled", True),
+            force_sub_in_groups=self.db["settings"].get("force_sub_in_groups", True),
+            force_sub_text=self.db["settings"].get("force_sub_text", self.default_db()["settings"]["force_sub_text"]),
+            is_admin=self.is_bot_admin(uid),
+            is_group_action=is_group_action,
+        )
 
     # ================= لوحة تحكم البوت (للمطور ولصانع البوت الفرعي) =================
     def build_admin_main_markup(self, viewer_id: int) -> InlineKeyboardMarkup:
